@@ -25,18 +25,25 @@ public class TimedOperation : NSOperation
     
     ///The thread in which NSTimer creation/destruction operations are called for TimedOperation.
     static var timerOperationThread : NSThread {
-        let timerOperationThread : NSThread = NSThread(target: self, selector: #selector(TimedOperation.timerOperationThreadEntryPoint(_:)), object: nil)
-        timerOperationThread.start()
-        return timerOperationThread
+        struct TimerOperationThread {
+            static var onceToken : dispatch_once_t = 0
+            static var instance : NSThread?
+        }
+        dispatch_once(&TimerOperationThread.onceToken) {
+            let timerOperationThread : NSThread = NSThread(target: self, selector: #selector(TimedOperation.timerOperationThreadEntryPoint(_:)), object: nil)
+            timerOperationThread.start()
+            TimerOperationThread.instance = timerOperationThread
+        }
+        return TimerOperationThread.instance!
     }
     
     // MARK : Public variables
     
     ///Indicates the timeout period for the operation.
     var timeoutPeriod : NSTimeInterval? {
-        willSet {
-            if newValue < 0 {
-                NSException(name: NSInvalidArgumentException, reason: "timeoutPeriod cannot be set less than 0.", userInfo: nil).raise()
+        didSet {
+            if self.timeoutPeriod ?? 0 < 0 {
+                self.timeoutPeriod = nil
             }
         }
     }
@@ -57,7 +64,7 @@ public class TimedOperation : NSOperation
     private(set) public var hasStarted : Bool = false
     
     ///Property to indicate if this operation is paused.
-    private(set) public var paused : Bool = true
+    private(set) public var paused : Bool = false
     
     ///Read-only property to indicate whether or not the operation timed out. Subclasses can override setter to do cleanup.
     private(set) public var didTimeout : Bool = false {
@@ -85,17 +92,41 @@ public class TimedOperation : NSOperation
     ///Timemarker for last time the operation was executing.
     private var lastStartTime : NSTimeInterval?
     
-    ///dispatch_once token so that the completion block and timeout block cannot execute simutaniously if callsCompletionBlockAfterTimeout is false.
-    private var completionToken : dispatch_once_t = 0
-    
     // MARK : Initializers
     
     override init() {
-        self.timeoutPeriod = self.dynamicType.defaultTimeoutPeriod()
+        super.init()
+        self.commonInit(self.dynamicType.defaultTimeoutPeriod())
     }
     
-    init(timeoutPeriod: NSTimeInterval) {
+    init(_ timeoutPeriod: NSTimeInterval?) {
+        super.init()
+        self.commonInit(timeoutPeriod)
+    }
+    
+    func commonInit(timeoutPeriod: NSTimeInterval?) {
         self.timeoutPeriod = timeoutPeriod
+        let swizzledCompletionBlock : (() -> Void)? = {
+            [unowned self] in
+            let completionBlock : (() -> Void)? = self._completionBlock
+            let timeoutBlock : (() -> Void)? = self.timeoutBlock
+            let completionQueue = self.completionQueue
+            if self.didTimeout {
+                let callsCompletionBlockAfterTimeout = self.callsCompletionBlockAfterTimeout
+                dispatch_async(completionQueue, {
+                    timeoutBlock?()
+                    if callsCompletionBlockAfterTimeout {
+                        completionBlock?()
+                    }
+                })
+            }
+            else {
+                dispatch_async(completionQueue, {
+                    completionBlock?()
+                })
+            }
+        }
+        super.completionBlock = swizzledCompletionBlock
     }
     
     // MARK : Overrides
@@ -103,46 +134,25 @@ public class TimedOperation : NSOperation
     deinit {
         NSNotificationCenter.defaultCenter().removeObserver(self)
         self.timeRemaining = nil
-        self.performSelector(#selector(TimedOperation.destroyTimer), onThread: TimedOperation.timerOperationThread, withObject: nil, waitUntilDone: true)
+        self.destroyTimer()
     }
     
+    private var _completionBlock: (() -> Void)?
     override public var completionBlock: (() -> Void)? {
         get {
             return super.completionBlock
         }
         set {
-            let swizzledCompletionBlock : (() -> Void)? = {
-                [unowned self] in
-                let completionQueue = self.completionQueue
-                if self.didTimeout {
-                    dispatch_once(&self.completionToken, {
-                        dispatch_async(completionQueue, {
-                            self.timeoutBlock?()
-                        })
-                    })
-                }
-                
-                if self.callsCompletionBlockAfterTimeout {
-                    dispatch_async(completionQueue, {
-                        newValue?()
-                    })
-                }
-                else {
-                    dispatch_once(&self.completionToken, {
-                        dispatch_async(completionQueue, {
-                            newValue?()
-                        })
-                    })
-                }
-            }
-            super.completionBlock = swizzledCompletionBlock
+            self._completionBlock = newValue
         }
     }
     
     override public func start() {
-        self.timeRemaining = self.timeoutPeriod
-        self.hasStarted = true
-        self.resume()
+        if !self.hasStarted && !self.finished {
+            self.timeRemaining = self.timeoutPeriod
+            self.hasStarted = true
+            self.resume()
+        }
     }
     
     private var _executing: Bool = false
@@ -173,62 +183,94 @@ public class TimedOperation : NSOperation
         }
     }
     
+    override public func cancel() {
+        if !self.finished {
+            super.cancel()
+            self.paused = false
+            self.executing = false
+            self.finished = true
+            self.destroyTimer()
+        }
+    }
+    
     // MARK : Public Methods
     
     ///Function to resume the functionality of this operation. Subclasses should override this class to provide the logic to execute. All subclasses should call super.resume and take the return value to determine if additional logic should be executed.
     public func resume() -> Bool {
-        let shouldResume : Bool = !self.cancelled && !self.executing && self.hasStarted
+        let shouldResume : Bool = !self.finished && !self.executing && self.hasStarted
         if shouldResume {
             self.paused = false
-            self.performSelector(#selector(TimedOperation.createTimer), onThread: TimedOperation.timerOperationThread, withObject: nil, waitUntilDone: true)
+            self.createTimer()
             self.executing = true
         }
         return shouldResume
     }
     
     ///Function to pause execution of this operation.
-    public func pause() {
-        if self.executing {
+    public func pause() -> Bool {
+        let willPause : Bool = self.executing
+        if willPause {
             self.paused = true
             self.executing = false
-            self.performSelector(#selector(TimedOperation.destroyTimer), onThread: TimedOperation.timerOperationThread, withObject: nil, waitUntilDone: true)
+            self.destroyTimer()
         }
+        return willPause
+    }
+    
+    public func didFinish() {
+        self.executing = false;
+        self.finished = true;
+        self.destroyTimer()
+    }
+    
+    ///Method to determine the default amount of time instances of this class has to complete. Defaults to nil if not overriden.
+    public class func defaultTimeoutPeriod() -> NSTimeInterval? {
+        return nil
     }
     
     // MARK : Private Methods (Standard)
     
     ///Creates the timeout timer based on the amount of time remaining for this operation to complete.
     internal func createTimer() {
+        self.performSelector(#selector(TimedOperation._createTimer), onThread: TimedOperation.timerOperationThread, withObject: nil, waitUntilDone: true)
+    }
+    
+    internal func _createTimer() {
         guard self.timeRemaining != nil else {
             return;
         }
         self.lastStartTime = NSDate.timeIntervalSinceReferenceDate()
-        self.timeoutTimer = NSTimer(timeInterval: self.timeRemaining!, target: self, selector: #selector(TimedOperation.destroyTimer), userInfo: nil, repeats: false)
+        self.timeoutTimer = NSTimer(timeInterval: self.timeRemaining!, target: self, selector: #selector(TimedOperation._destroyTimer), userInfo: nil, repeats: false)
     }
     
     
     ///Destroys the current timeout timer and decrements the amount of time remaining based on the elapsed time since the timer was created.
     internal func destroyTimer() {
+        self.performSelector(#selector(TimedOperation._destroyTimer), onThread: TimedOperation.timerOperationThread, withObject: nil, waitUntilDone: true)
+    }
+    
+    internal func _destroyTimer() {
         self.timeoutTimer = nil
+        if self.finished {
+            return;
+        }
         guard self.timeRemaining != nil else {
             return;
         }
         let currentTime : NSTimeInterval = NSDate.timeIntervalSinceReferenceDate()
         let elapsedTime : NSTimeInterval = currentTime - self.lastStartTime!
         self.timeRemaining = self.timeRemaining! - elapsedTime
+        if self.timeRemaining < 0 {
+            self.handleTimeout()
+        }
     }
     
     ///Method that is called when the operation times out.
-    private func handleTimeout() {
+    internal func handleTimeout() {
         if !self.finished {
             self.didTimeout = true
             self.cancel()
         }
-    }
-    
-    ///Method to determine the default amount of time instances of this class has to complete. Defaults to nil if not overriden.
-    private class func defaultTimeoutPeriod() -> NSTimeInterval? {
-        return nil
     }
     
     // MARK : Private Methods (Timer Thread)
